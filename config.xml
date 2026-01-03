@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<module>
+  <name>jsrequired</name>
+  <displayName><![CDATA[Checkout JS / payment widget warning]]></displayName>
+    <version><![CDATA[2.9.4]]></version>
+  <description><![CDATA[Shows a banner when JavaScript is disabled and warns when blockers/CSP prevent payment widgets (Revolut / Stripe / PayPal / PrestaShop Checkout) from loading.]]></description>
+  <author><![CDATA[Custom]]></author>
+  <tab><![CDATA[front_office_features]]></tab>
+  <is_configurable>1</is_configurable>
+  <need_instance>0</need_instance>
+</module>
