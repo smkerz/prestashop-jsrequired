@@ -1,6 +1,6 @@
 /*!
  * jsrequired - Payment widget blocker detector for PrestaShop 1.7
- * Version: 2.9.4
+ * Version: 2.9.7
  *
  * Detects when payment widgets (Revolut / Stripe / PayPal via PrestaShop Checkout) fail to render
  * due to script/iframe blockers (NoScript, adblockers, anti-trackers) or CSP restrictions,
@@ -10,7 +10,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '2.9.4';
+  var VERSION = '2.9.10';
   var cfg = window.jsrequiredConfig || {};
 
   // Back office options (injected via Media::addJsDef)
@@ -151,6 +151,15 @@
 
   function qs(sel, root) { return (root || document).querySelector(sel); }
   function qsa(sel, root) { return (root || document).querySelectorAll(sel); }
+
+  // Check if any visible iframe matches the selector
+  function hasIframe(selector, root) {
+    var iframes = qsa(selector, root || document);
+    for (var i = 0; i < iframes.length; i++) {
+      if (isVisible(iframes[i])) return true;
+    }
+    return false;
+  }
 
   function isVisible(el) {
     if (!el) return false;
@@ -559,22 +568,47 @@
   }
 
   function detectProviderFromInput(input, scopesInfo) {
-    var moduleName = getModuleNameFromInput(input);
+    var moduleName = getModuleNameFromInput(input).toLowerCase();
+    var inputId = input ? (input.id || '').toLowerCase() : '';
+
+    log('detectProviderFromInput: moduleName="' + moduleName + '", inputId="' + inputId + '"');
 
     // Requirement A: ps_checkout mode is determined structurally.
-    if (moduleName.indexOf('ps_checkout') === 0 || moduleName.indexOf('ps_checkout') !== -1 || moduleName.indexOf('prestashop checkout') !== -1) {
+    if (moduleName.indexOf('ps_checkout') !== -1 || moduleName.indexOf('prestashop checkout') !== -1) {
+      log('detectProviderFromInput: matched ps_checkout by moduleName');
       return 'ps_checkout';
     }
 
-    if (moduleName.indexOf('revolut') !== -1 || inScopes(scopesInfo, '#revolut_card') || inScopes(scopesInfo, 'script[src*="merchant.revolut.com"],iframe[src*="merchant.revolut.com"],script[src*="revolut"],iframe[src*="revolut"]')) {
+    // STEP 1: Check SPECIFIC markers for the selected payment option
+    // These are tied to the actual input (moduleName, inputId, scopes)
+    // Do NOT use page-wide checks here - they would incorrectly match other providers
+
+    var revolutByModuleName = moduleName.indexOf('revolut') !== -1;
+    var revolutByInputId = inputId.indexOf('revolut') !== -1;
+    var revolutInScopes = inScopes(scopesInfo, '#revolut_card,[id*="revolut"]');
+    log('detectProviderFromInput: revolut specific - byModuleName=' + revolutByModuleName + ', byInputId=' + revolutByInputId + ', inScopes=' + revolutInScopes);
+
+    var stripeByModuleName = moduleName.indexOf('stripe') !== -1;
+    var stripeByInputId = inputId.indexOf('stripe') !== -1;
+    var stripeInScopes = inScopes(scopesInfo, '#stripe-payment-element,#payment-element,.StripeElement,[data-stripe-element]');
+    log('detectProviderFromInput: stripe specific - byModuleName=' + stripeByModuleName + ', byInputId=' + stripeByInputId + ', inScopes=' + stripeInScopes);
+
+    var paypalByModuleName = moduleName.indexOf('paypal') !== -1;
+    var paypalByInputId = inputId.indexOf('paypal') !== -1;
+    var paypalInScopes = inScopes(scopesInfo, '#paypal-buttons,#paypal-button-container,.paypal-buttons');
+    log('detectProviderFromInput: paypal specific - byModuleName=' + paypalByModuleName + ', byInputId=' + paypalByInputId + ', inScopes=' + paypalInScopes);
+
+    // Return based on SPECIFIC markers only (not page-wide)
+    if (revolutByModuleName || revolutByInputId || revolutInScopes) {
+      log('detectProviderFromInput: matched revolut by specific marker');
       return 'revolut';
     }
-
-    if (moduleName.indexOf('stripe') !== -1 || inScopes(scopesInfo, '#stripe-payment-element,#payment-element,.StripeElement,[data-stripe-element],script[src*="js.stripe.com"],script[src*="stripe.com"],iframe[src*="js.stripe.com"],iframe[src*="stripe.com"]')) {
+    if (stripeByModuleName || stripeByInputId || stripeInScopes) {
+      log('detectProviderFromInput: matched stripe by specific marker');
       return 'stripe';
     }
-
-    if (moduleName.indexOf('paypal') !== -1 || inScopes(scopesInfo, '#paypal-buttons,#paypal-button-container,.paypal-buttons,script[src*="paypal.com/sdk/js"],iframe[name^="__zoid__paypal"],iframe[src*="paypal.com"],iframe[src*="paypalobjects.com"]')) {
+    if (paypalByModuleName || paypalByInputId || paypalInScopes) {
+      log('detectProviderFromInput: matched paypal by specific marker');
       return 'paypal';
     }
 
@@ -588,7 +622,91 @@
       }
     }
 
+    // Check for card payment keywords in the label/module name
+    // This catches generic card payment options that need a widget
+    var looksLikeCardPayment = (
+      moduleName.indexOf('carte') !== -1 ||
+      moduleName.indexOf('card') !== -1 ||
+      moduleName.indexOf('crédit') !== -1 ||
+      moduleName.indexOf('credit') !== -1 ||
+      moduleName.indexOf('débit') !== -1 ||
+      moduleName.indexOf('debit') !== -1
+    );
+
+    if (looksLikeCardPayment) {
+      // It's a card payment - check what provider is on the page
+      if (qs('script[src*="revolut"],#revolut_card,[id*="revolut"]', document)) {
+        return 'revolut';
+      }
+      if (qs('script[src*="stripe"],.StripeElement,[id*="stripe"]', document)) {
+        return 'stripe';
+      }
+      if (qs('script[src*="paypal"],[id*="paypal"]', document)) {
+        return 'paypal';
+      }
+      // Generic card payment that expects a widget
+      return 'generic';
+    }
+
+    // Generic detection: if the payment option has external scripts or expects iframes/widgets,
+    // treat it as a generic JS-dependent payment method.
+    if (paymentOptionExpectsWidget(input, scopesInfo)) {
+      return 'generic';
+    }
+
     return null;
+  }
+
+  // Check if a payment option appears to need a JS widget to function
+  function paymentOptionExpectsWidget(input, scopesInfo) {
+    if (!input) return false;
+
+    var scopes = (scopesInfo && scopesInfo.scopes) ? scopesInfo.scopes : [];
+    var step = getPaymentStepRoot() || document;
+
+    // Check if there are external payment scripts in the scopes or page
+    for (var i = 0; i < scopes.length; i++) {
+      var scope = scopes[i];
+      if (!scope) continue;
+
+      // Look for external payment-related scripts
+      var scripts = qsa('script[src]', scope);
+      for (var j = 0; j < scripts.length; j++) {
+        var src = (scripts[j].src || '').toLowerCase();
+        // Common payment gateway domains
+        if (src.indexOf('paypal') !== -1 ||
+            src.indexOf('stripe') !== -1 ||
+            src.indexOf('revolut') !== -1 ||
+            src.indexOf('braintree') !== -1 ||
+            src.indexOf('adyen') !== -1 ||
+            src.indexOf('mollie') !== -1 ||
+            src.indexOf('checkout.com') !== -1 ||
+            src.indexOf('square') !== -1 ||
+            src.indexOf('klarna') !== -1) {
+          return true;
+        }
+      }
+
+      // Look for placeholder divs that typically hold widgets
+      if (qs('[id*="card"], [id*="payment-element"], [id*="widget"], [class*="card-field"], [class*="payment-widget"]', scope)) {
+        return true;
+      }
+    }
+
+    // Check the additional-information section for signs of a widget
+    var id = input.id;
+    var additionalInfo = id ? document.getElementById(id + '-additional-information') : null;
+    if (additionalInfo) {
+      // If there's an additional info section with minimal visible content but scripts/placeholders,
+      // it likely expects a widget to render
+      var hasScript = !!qs('script[src]', additionalInfo);
+      var hasPlaceholder = !!qs('[id*="card"], [id*="payment"], [id*="widget"], [data-payment], [class*="card"], [class*="payment-form"]', additionalInfo);
+      if (hasScript || hasPlaceholder) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   // Provider detection
@@ -781,7 +899,9 @@
     if (provider === 'revolut') {
       var scope = mount || document;
       // Requirement E: treat Revolut as ready only when its iframe/widget really appears.
-      return !!qs('iframe[src*="merchant.revolut.com"], #revolut_card iframe, iframe[data-revolut]', scope);
+      var revolutIframe = qs('iframe[src*="merchant.revolut.com"], #revolut_card iframe, iframe[data-revolut]', scope);
+      log('widgetLooksReady(revolut): iframe found=' + !!revolutIframe);
+      return !!revolutIframe;
     }
 
     if (provider === 'stripe') {
@@ -823,6 +943,37 @@
              hasPsCheckoutIndicators(document, mn);
     }
 
+    if (provider === 'generic') {
+      // For generic payment widgets, check if there are visible iframes or
+      // interactive elements that indicate the widget has loaded
+      var scope = mount || document;
+
+      // Check for any payment-related iframes
+      if (hasIframe('iframe[src*="paypal"],iframe[src*="stripe"],iframe[src*="revolut"],iframe[src*="braintree"],iframe[src*="adyen"],iframe[src*="mollie"],iframe[src*="checkout.com"],iframe[src*="klarna"]', scope)) {
+        return true;
+      }
+
+      // Check for visible card input fields (real inputs, not placeholders)
+      var cardInputs = qsa('input[autocomplete="cc-number"], input[name*="card"], input[id*="card-number"], input[placeholder*="card"], input[type="tel"][maxlength="19"]', scope);
+      for (var gi = 0; gi < cardInputs.length; gi++) {
+        if (isVisible(cardInputs[gi])) return true;
+      }
+
+      // Check for any visible iframe in the payment additional info
+      var input = getCheckedPaymentOption();
+      if (input && input.id) {
+        var additionalInfo = document.getElementById(input.id + '-additional-information');
+        if (additionalInfo) {
+          var iframes = qsa('iframe', additionalInfo);
+          for (var gj = 0; gj < iframes.length; gj++) {
+            if (isVisible(iframes[gj])) return true;
+          }
+        }
+      }
+
+      return false;
+    }
+
     return false;
   }
 
@@ -854,22 +1005,46 @@
 
     var input = selectedPaymentInput();
     var anchor = null;
+    var insertAfterEl = null;
 
     if (input) {
-      anchor = paymentOptionContainerFromInput(input) || container || getPaymentStepRoot();
+      // Try to find the additional-information or form section for this payment option
+      var id = input.id;
+      var additionalInfo = id ? document.getElementById(id + '-additional-information') : null;
+      var formSection = id ? document.getElementById('pay-with-' + id + '-form') : null;
+
+      // Prefer placing after the additional-information or form section
+      // This avoids interfering with the clickable payment option header
+      if (additionalInfo && isVisible(additionalInfo)) {
+        anchor = additionalInfo.parentNode || container || getPaymentStepRoot();
+        insertAfterEl = additionalInfo;
+      } else if (formSection && isVisible(formSection)) {
+        anchor = formSection.parentNode || container || getPaymentStepRoot();
+        insertAfterEl = formSection;
+      } else {
+        anchor = paymentOptionContainerFromInput(input) || container || getPaymentStepRoot();
+      }
     } else {
       anchor = getPaymentStepRoot() || container;
     }
 
     if (!anchor) return;
 
-    // Ensure the inline banner is inside the anchor (not body)
+    // Ensure the inline banner is inside the anchor
     try {
-      if (inline.parentNode !== anchor) {
+      if (inline.parentNode !== anchor || (insertAfterEl && inline.previousElementSibling !== insertAfterEl)) {
         // Remove from current parent
         if (inline.parentNode) inline.parentNode.removeChild(inline);
-        // Place near top of the selected payment option container
-        anchor.insertBefore(inline, anchor.firstChild);
+
+        // Place after the payment content (not at the beginning) to avoid click interference
+        if (insertAfterEl && insertAfterEl.nextSibling) {
+          anchor.insertBefore(inline, insertAfterEl.nextSibling);
+        } else if (insertAfterEl) {
+          anchor.appendChild(inline);
+        } else {
+          // Fallback: append at end of anchor instead of beginning
+          anchor.appendChild(inline);
+        }
       }
     } catch (e) {
       // fallback to body
@@ -911,10 +1086,16 @@
         return 'Préparation du champ carte Revolut en cours…';
       case 'ps_checkout':
         return 'Préparation de PrestaShop Checkout en cours…';
+      case 'generic':
+        return 'Préparation du moyen de paiement en cours…';
       default:
         return 'Préparation du paiement en cours…';
     }
   }
+
+  // Timer for delayed verifying message display
+  var verifyingDisplayTimer = null;
+  var VERIFYING_DISPLAY_DELAY = 700; // ms before showing "verifying" message
 
   function showVerifying(provider, container) {
     // Keep banner hidden during the verification phase; we only show a clear
@@ -922,29 +1103,51 @@
     var b = bannerEl();
     if (b) b.style.display = 'none';
 
+    // Always disable the confirm button immediately for safety
+    disableConfirm(true);
+
     if (!SHOW_INLINE) {
-      // Even without inline banners, we still hard-disable the confirm button.
-      disableConfirm(true);
       return;
     }
 
-    var inline = ensureInlineBanner();
-    inline.className = 'alert alert-info';
-    var inlineMsg = document.getElementById('jsrequired-inline-message');
-    if (inlineMsg) inlineMsg.textContent = verifyingMessage(provider) + ' Si cela reste bloqué, un message explicatif s’affichera.';
+    // Clear any pending display timer
+    if (verifyingDisplayTimer) {
+      window.clearTimeout(verifyingDisplayTimer);
+      verifyingDisplayTimer = null;
+    }
 
-    // During verification, the "Copier le diagnostic" button would copy the previous
-    // blocked snapshot (or nothing). Hide it to avoid confusion.
-    var copyBtn = inline.querySelector('.jsrequired-copy-diagnostic');
-    if (copyBtn) copyBtn.style.display = 'none';
+    // Delay showing the inline message to avoid flickering/interference
+    // when widgets load quickly
+    verifyingDisplayTimer = window.setTimeout(function() {
+      verifyingDisplayTimer = null;
 
-    placeInlineBanner(container || getPaymentStepRoot() || document.body);
-    inline.style.display = 'block';
+      // Check if we're still in verifying state
+      if (!STATE.verifying) return;
+      // Check if widget became ready in the meantime
+      if (STATE.active) return;
 
-    disableConfirm(true);
+      var inline = ensureInlineBanner();
+      inline.className = 'alert alert-info';
+      var inlineMsg = document.getElementById('jsrequired-inline-message');
+      if (inlineMsg) inlineMsg.textContent = verifyingMessage(provider) + ' Si cela reste bloqué, un message explicatif s\'affichera.';
+
+      // During verification, the "Copier le diagnostic" button would copy the previous
+      // blocked snapshot (or nothing). Hide it to avoid confusion.
+      var copyBtn = inline.querySelector('.jsrequired-copy-diagnostic');
+      if (copyBtn) copyBtn.style.display = 'none';
+
+      placeInlineBanner(container || getPaymentStepRoot() || document.body);
+      inline.style.display = 'block';
+    }, VERIFYING_DISPLAY_DELAY);
   }
 
   function hideVerifying() {
+    // Clear any pending display timer
+    if (verifyingDisplayTimer) {
+      window.clearTimeout(verifyingDisplayTimer);
+      verifyingDisplayTimer = null;
+    }
+
     if (!STATE.verifying) return;
 
     setVerifying(false);
@@ -1643,8 +1846,11 @@
   }
 
   function init() {
+    log('init: starting jsrequired v' + VERSION);
+
     // Detect env mode once early (can be recomputed later if needed).
     STATE.mode = detectEnvironmentMode();
+    log('init: mode=' + STATE.mode);
 
     // Restore last clicked payment option to keep behavior robust when themes
     // intercept selection and the radio isn't checked yet.
@@ -1660,6 +1866,24 @@
     attachResourceBlockTrap();
     attachRuntimeErrorTrap();
     attachEvents();
+
+    // IMPORTANT: If a payment option is already selected on page load,
+    // start the async check immediately (don't wait for user interaction).
+    var preSelectedInput = selectedPaymentInput();
+    if (preSelectedInput) {
+      log('init: found pre-selected payment option:', preSelectedInput.id);
+      setLastChoiceFromInput(preSelectedInput);
+      // Use a small delay to let the page finish rendering
+      window.setTimeout(function() {
+        var stillSelected = selectedPaymentInput();
+        if (stillSelected && stillSelected.id === preSelectedInput.id) {
+          log('init: starting async check for pre-selected option:', stillSelected.id);
+          startAsyncCheckForInput(stillSelected, 'init');
+        }
+      }, 500);
+    } else {
+      log('init: no pre-selected payment option');
+    }
 
     evaluateSoon();
   }

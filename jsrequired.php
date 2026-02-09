@@ -15,7 +15,7 @@ class JsRequired extends Module
     {
         $this->name = 'jsrequired';
         $this->tab = 'front_office_features';
-        $this->version = '2.9.4';
+        $this->version = '2.9.10';
         $this->author = 'Custom';
         $this->need_instance = 0;
         $this->bootstrap = true;
@@ -360,6 +360,9 @@ class JsRequired extends Module
         if (!$this->shouldRunHere()) {
             return;
         }
+
+        // Ensure diagnostic token exists (for modules upgraded from older versions)
+        $this->initDiagnosticStorage();
 
         // Expose config to JS (used for dynamic banner creation fallback)
         Media::addJsDef([
